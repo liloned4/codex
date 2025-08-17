@@ -167,7 +167,8 @@ server {
 
     # OHIF Viewer
     location /viewer/ {
-        proxy_pass http://ohif/;
+        # Forward OHIF viewer requests to the viewer container
+        proxy_pass http://ohif:80/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_read_timeout 300s;
