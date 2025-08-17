@@ -93,7 +93,7 @@ install_docker_compose() {
 # Create project structure
 create_project() {
     print_status "Creating project structure..."
-    mkdir -p orthanc-production/{orthanc/config,nginx/config,viewer,data}
+    mkdir -p orthanc-production/{orthanc/config,nginx/config,portal,ohif/config,data}
     cd orthanc-production
 }
 
@@ -139,43 +139,51 @@ server {
     listen 80;
     server_name _;
     client_max_body_size 500M;
-    
+
     # Health check
     location /health {
         return 200 "healthy\n";
         add_header Content-Type text/plain;
     }
-    
+
     # Orthanc API
     location /orthanc/ {
         proxy_pass http://orthanc:8042/;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_read_timeout 300s;
-        
-        # CORS headers
+
         add_header Access-Control-Allow-Origin *;
         add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS";
         add_header Access-Control-Allow-Headers "Content-Type, Authorization";
     }
-    
+
     # DICOM Web
     location /dicom-web/ {
         proxy_pass http://orthanc:8042/dicom-web/;
         proxy_set_header Host $host;
         add_header Access-Control-Allow-Origin *;
     }
-    
-    # Viewer Portal
+
+    # OHIF Viewer
     location /viewer/ {
-        alias /usr/share/nginx/html/viewer/;
+        proxy_pass http://ohif/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 300s;
+        add_header Access-Control-Allow-Origin *;
+    }
+
+    # Portal
+    location /portal/ {
+        alias /usr/share/nginx/html/portal/;
         try_files $uri $uri/ /index.html;
         index index.html;
     }
-    
+
     # Root redirect
     location = / {
-        return 301 /viewer/;
+        return 301 /portal/;
     }
 }
 EOF
@@ -184,7 +192,7 @@ EOF
 # Create viewer portal
 create_viewer_portal() {
     print_status "Creating viewer portal..."
-    cat > viewer/index.html << EOF
+    cat > portal/index.html << EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -288,7 +296,7 @@ create_viewer_portal() {
             </div>
 
             <div style="text-align: center; margin: 30px 0;">
-                <a href="/orthanc/app/explorer.html" class="btn primary">
+                <a href="/viewer/" class="btn primary">
                     🖼️ START DICOM VIEWER
                 </a>
             </div>
@@ -296,9 +304,9 @@ create_viewer_portal() {
             <div class="grid">
                 <div class="card">
                     <div class="icon">📋</div>
-                    <h3>DICOM Explorer</h3>
+                    <h3>OHIF Viewer</h3>
                     <p>Upload, view, and manage DICOM studies and images</p>
-                    <a href="/orthanc/app/explorer.html" class="btn">Open Explorer</a>
+                    <a href="/viewer/" class="btn">Open Viewer</a>
                 </div>
                 
                 <div class="card">
@@ -338,7 +346,7 @@ create_viewer_portal() {
             <div style="background: #fff3cd; padding: 20px; border-radius: 10px; margin: 20px 0;">
                 <h3 style="color: #856404;">🔗 Quick Access:</h3>
                 <p style="margin: 10px 0;">
-                    <a href="/orthanc/app/explorer.html" style="color: #0066cc; font-weight: bold;">DICOM Viewer</a> | 
+                    <a href="/viewer/" style="color: #0066cc; font-weight: bold;">DICOM Viewer</a> | 
                     <a href="/orthanc/" style="color: #0066cc; font-weight: bold;">Admin</a> | 
                     <a href="http://$SERVER_IP:6661" style="color: #0066cc; font-weight: bold;">Mirth</a> | 
                     <a href="/health" style="color: #0066cc; font-weight: bold;">Health</a>
@@ -364,6 +372,33 @@ create_viewer_portal() {
 EOF
 }
 
+# Create OHIF config
+create_ohif_config() {
+    print_status "Creating OHIF configuration..."
+    cat > ohif/config/app-config.js << 'EOF'
+const dicomWebRoot = `${window.location.origin}/dicom-web`;
+
+window.config = {
+  routerBasename: '/',
+  extensions: [],
+  modes: [],
+  dataSources: [
+    {
+      friendlyName: 'Orthanc DICOMweb',
+      namespace: '@ohif/extension-default.dataSources.dicomweb',
+      sourceName: 'orthanc',
+      configuration: {
+        name: 'orthanc',
+        wadoUriRoot: dicomWebRoot,
+        qidoRoot: dicomWebRoot,
+        wadoRoot: dicomWebRoot,
+      },
+    },
+  ],
+};
+EOF
+}
+
 # Create simple Docker Compose (no complex dependencies)
 create_docker_compose() {
     print_status "Creating Docker Compose configuration..."
@@ -386,6 +421,20 @@ services:
     restart: unless-stopped
     command: ["/etc/orthanc/orthanc.json"]
 
+  # OHIF Viewer
+  ohif:
+    image: ohif/app:latest
+    container_name: orthanc_ohif
+    depends_on:
+      - orthanc
+    environment:
+      - APP_CONFIG=/usr/share/nginx/html/app-config.js
+    volumes:
+      - ./ohif/config/app-config.js:/usr/share/nginx/html/app-config.js:ro
+    networks:
+      - orthanc_net
+    restart: unless-stopped
+
   # NGINX Reverse Proxy
   nginx:
     image: nginx:alpine
@@ -394,9 +443,10 @@ services:
       - "80:80"
     volumes:
       - ./nginx/config:/etc/nginx/conf.d:ro
-      - ./viewer:/usr/share/nginx/html/viewer:ro
+      - ./portal:/usr/share/nginx/html/portal:ro
     depends_on:
       - orthanc
+      - ohif
     networks:
       - orthanc_net
     restart: unless-stopped
@@ -448,6 +498,11 @@ else
     exit 1
 fi
 
+# Start OHIF
+echo "Starting OHIF..."
+docker-compose up -d ohif
+sleep 20
+
 # Start NGINX
 echo "Starting NGINX..."
 docker-compose up -d nginx
@@ -463,8 +518,8 @@ echo "🎉 Stack Started Successfully!"
 echo ""
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo "Access URLs:"
-echo "• Main Portal: http://$SERVER_IP/viewer/"
-echo "• DICOM Viewer: http://$SERVER_IP/orthanc/app/explorer.html"
+echo "• Main Portal: http://$SERVER_IP/portal/"
+echo "• OHIF Viewer: http://$SERVER_IP/viewer/"
 echo "• Admin Panel: http://$SERVER_IP/orthanc/"
 echo "• Mirth Connect: http://$SERVER_IP:6661"
 echo "• Health Check: http://$SERVER_IP/health"
@@ -489,7 +544,8 @@ echo ""
 echo "🔍 Service Tests:"
 curl -s http://localhost/health && echo "✅ NGINX: OK" || echo "❌ NGINX: Failed"
 curl -s http://localhost:8042/system >/dev/null && echo "✅ Orthanc: OK" || echo "❌ Orthanc: Failed"
-curl -s http://localhost/viewer/ | grep -q "DICOM" && echo "✅ Portal: OK" || echo "❌ Portal: Failed"
+curl -s http://localhost/ | grep -q "DICOM Medical System" && echo "✅ Portal: OK" || echo "❌ Portal: Failed"
+curl -s http://localhost/viewer/ | grep -q "OHIF" && echo "✅ OHIF: OK" || echo "❌ OHIF: Failed"
 EOF
 
     # Logs script
@@ -499,7 +555,7 @@ if [ "$1" ]; then
     docker-compose logs -f "$1"
 else
     echo "Usage: ./logs.sh [service]"
-    echo "Services: orthanc, nginx, mirth"
+    echo "Services: orthanc, ohif, nginx, mirth"
 fi
 EOF
 
@@ -528,6 +584,7 @@ main() {
     create_orthanc_config
     create_nginx_config
     create_viewer_portal
+    create_ohif_config
     create_docker_compose
     create_management_scripts
     configure_firewall
@@ -541,7 +598,7 @@ main() {
     print_status "Starting Orthanc..."
     docker-compose up -d orthanc
     sleep 30
-    
+
     # Test Orthanc
     if curl -s http://localhost:8042/system >/dev/null; then
         print_status "Orthanc started successfully"
@@ -550,12 +607,17 @@ main() {
         docker logs orthanc_server --tail 20
         exit 1
     fi
-    
+
+    # Start OHIF
+    print_status "Starting OHIF..."
+    docker-compose up -d ohif
+    sleep 20
+
     # Start NGINX
     print_status "Starting NGINX..."
     docker-compose up -d nginx
     sleep 10
-    
+
     # Start Mirth
     print_status "Starting Mirth..."
     docker-compose up -d mirth
@@ -571,8 +633,8 @@ main() {
     echo "========================================="
     echo ""
     echo -e "${BLUE}🎯 ACCESS URLS:${NC}"
-    echo "• Main Portal: http://$SERVER_IP/viewer/"
-    echo "• DICOM Viewer: http://$SERVER_IP/orthanc/app/explorer.html"
+    echo "• Main Portal: http://$SERVER_IP/portal/"
+    echo "• OHIF Viewer: http://$SERVER_IP/viewer/"
     echo "• Admin Panel: http://$SERVER_IP/orthanc/ (admin/admin123)"
     echo "• Mirth Connect: http://$SERVER_IP:6661 (admin/admin)"
     echo "• Health Check: http://$SERVER_IP/health"
@@ -595,7 +657,8 @@ main() {
     sleep 5
     curl -s http://localhost/health && echo "✅ Health check passed" || echo "❌ Health check failed"
     curl -s http://localhost/orthanc/system >/dev/null && echo "✅ Orthanc API working" || echo "❌ Orthanc API failed"
-    curl -s http://localhost/viewer/ | grep -q "DICOM" && echo "✅ Portal working" || echo "❌ Portal failed"
+    curl -s http://localhost/ | grep -q "DICOM Medical System" && echo "✅ Portal working" || echo "❌ Portal failed"
+    curl -s http://localhost/viewer/ | grep -q "OHIF" && echo "✅ OHIF viewer working" || echo "❌ OHIF viewer failed"
 }
 
 # Run installation
@@ -604,4 +667,4 @@ main
 print_status "Installation completed!"
 echo ""
 echo "🎊 Your DICOM server is ready!"
-echo "Open: http://$SERVER_IP/viewer/"
+echo "Open: http://$SERVER_IP/"
